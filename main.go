@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"sync"
 	"text/template"
 
 	"github.com/ghostec/tracer"
@@ -12,14 +13,72 @@ import (
 
 var addr = flag.String("addr", "0.0.0.0:8080", "http service address")
 
+var lookFrom = tracer.Point3{-0, 2, 1}
+
+type renderer struct {
+	frame   *tracer.Frame
+	stop    chan bool
+	mu      sync.Mutex
+	frameId uint64
+}
+
+func newFrame() *tracer.Frame {
+	imageWidth := 1000
+	imageHeight := int(float64(imageWidth) / (16.0 / 9.0))
+	return tracer.NewFrame(imageWidth, imageHeight)
+}
+
+func newRenderer() *renderer {
+	return &renderer{
+		frame: newFrame(),
+		stop:  make(chan bool, 1),
+	}
+}
+
+func (r *renderer) render() {
+	r.mu.Lock()
+	frameId := r.frameId
+	r.mu.Unlock()
+	frame := newFrame()
+	render(frame, lookFrom, r.stop)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.frameId == frameId {
+		r.frame.Avg(frame)
+	}
+}
+
+func (r *renderer) reset() {
+	r.mu.Lock()
+	close(r.stop)
+	r.stop = make(chan bool, 1)
+	r.frame = newFrame()
+	r.frameId += 1
+	r.mu.Unlock()
+}
+
+func (r *renderer) PPM() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.frame.PPM()
+}
+
+var rendererObj = newRenderer()
+
 func main() {
 	flag.Parse()
 	http.HandleFunc("/ws", ws)
 	http.HandleFunc("/", home)
+	go func() {
+		for {
+			rendererObj.render()
+		}
+	}()
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
-
-var lookFrom = tracer.Point3{-0, 2, 1}
 
 func ws(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{}
@@ -35,8 +94,16 @@ func ws(w http.ResponseWriter, r *http.Request) {
 			log.Println("read:", err)
 			break
 		}
-		log.Printf("recv: %s", message)
+		// log.Printf("recv: %s", message)
 		switch string(message) {
+		case "frame":
+			message = []byte(rendererObj.PPM())
+			err = c.WriteMessage(mt, message)
+			if err != nil {
+				log.Println("write:", err)
+				break
+			}
+			continue
 		case "1":
 			lookFrom[2] -= 0.5
 		case "2":
@@ -46,19 +113,11 @@ func ws(w http.ResponseWriter, r *http.Request) {
 		case "4":
 			lookFrom[0] += 0.5
 		}
-		message = []byte(render(lookFrom).PPM())
-		err = c.WriteMessage(mt, message)
-		if err != nil {
-			log.Println("write:", err)
-			break
-		}
+		rendererObj.reset()
 	}
 }
 
-func render(lookFrom tracer.Point3) *tracer.Frame {
-	imageWidth := 1000
-	imageHeight := int(float64(imageWidth) / (16.0 / 9.0))
-
+func render(frame *tracer.Frame, lookFrom tracer.Point3, stop <-chan bool) {
 	var l tracer.HitterList
 	{
 		l = tracer.HitterList{
@@ -78,11 +137,7 @@ func render(lookFrom tracer.Point3) *tracer.Frame {
 		VUp:         tracer.Vec3{0, 1, 0},
 	}
 
-	frame := tracer.NewFrame(imageWidth, imageHeight)
-
-	tracer.Render(frame, cam, l, 200, 20)
-
-	return frame
+	tracer.Render(frame, cam, l, 1, 20, stop)
 }
 
 func home(w http.ResponseWriter, r *http.Request) {
@@ -96,12 +151,10 @@ var homeTemplate = template.Must(template.New("").Parse(`
 <meta charset="utf-8">
 <script>  
 window.addEventListener("load", function(evt) {
-    var output = document.getElementById("output");
-    var input = document.getElementById("input");
     var ws;
 		ws = new WebSocket("{{.}}");
 		ws.onopen = function(evt) {
-				ws.send("render");
+				ws.send("frame");
 				document.onkeypress = function (e) {
 						e = e || window.event;
 						switch (String.fromCharCode(e.keyCode)) {
@@ -119,6 +172,7 @@ window.addEventListener("load", function(evt) {
 										break;
 						}
 				};
+				setInterval(() => ws.send("frame"), 1000)
 		}
 		ws.onclose = function(evt) {
 				ws = null;
