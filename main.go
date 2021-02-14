@@ -2,6 +2,8 @@ package main
 
 import (
 	"flag"
+	"image/png"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -59,11 +61,11 @@ func (r *renderer) reset() {
 	r.mu.Unlock()
 }
 
-func (r *renderer) PPM() string {
+func (r *renderer) Encode(w io.Writer) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	return r.frame.PPM()
+	return png.Encode(w, tracer.NewPPM(r.frame))
 }
 
 var rendererObj = newRenderer()
@@ -71,6 +73,7 @@ var rendererObj = newRenderer()
 func main() {
 	flag.Parse()
 	http.HandleFunc("/ws", ws)
+	http.HandleFunc("/frame.png", frame)
 	http.HandleFunc("/", home)
 	go func() {
 		for {
@@ -89,21 +92,13 @@ func ws(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.Close()
 	for {
-		mt, message, err := c.ReadMessage()
+		_, message, err := c.ReadMessage()
 		if err != nil {
 			log.Println("read:", err)
 			break
 		}
 		// log.Printf("recv: %s", message)
 		switch string(message) {
-		case "frame":
-			message = []byte(rendererObj.PPM())
-			err = c.WriteMessage(mt, message)
-			if err != nil {
-				log.Println("write:", err)
-				break
-			}
-			continue
 		case "1":
 			lookFrom[2] -= 0.5
 		case "2":
@@ -114,6 +109,12 @@ func ws(w http.ResponseWriter, r *http.Request) {
 			lookFrom[0] += 0.5
 		}
 		rendererObj.reset()
+	}
+}
+
+func frame(w http.ResponseWriter, r *http.Request) {
+	if err := rendererObj.Encode(w); err != nil {
+		log.Println("encode:", err)
 	}
 }
 
@@ -154,7 +155,6 @@ window.addEventListener("load", function(evt) {
     var ws;
 		ws = new WebSocket("{{.}}");
 		ws.onopen = function(evt) {
-				ws.send("frame");
 				document.onkeypress = function (e) {
 						e = e || window.event;
 						switch (String.fromCharCode(e.keyCode)) {
@@ -172,7 +172,6 @@ window.addEventListener("load", function(evt) {
 										break;
 						}
 				};
-				setInterval(() => ws.send("frame"), 1000)
 		}
 		ws.onclose = function(evt) {
 				ws = null;
@@ -200,11 +199,20 @@ window.addEventListener("load", function(evt) {
 		ws.onerror = function(evt) {
 				console.log("ERROR: " + evt.data);
 		}
+
+		function refreshImage() {    
+				const timestamp = new Date().getTime();  
+				const el = document.getElementById("image");
+				const queryString = "?t=" + timestamp;
+				el.src = "frame.png" + queryString;    
+		}
+		
+		setInterval(refreshImage, 500);
 });
 </script>
 </head>
 <body>
-	<canvas id="canvas" width=1000 height=562></canvas>
+	<img id="image" />
 </body>
 </html>
 `))
